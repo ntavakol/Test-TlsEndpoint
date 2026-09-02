@@ -249,10 +249,9 @@ With `--targets`, the exit code is the highest code any target produced.
 - A payload sent with `--send-syslog` or `--send-raw` rides a second
   connection, so the inspection transcript stays clean. All `--count` messages
   still share one connection, which is what the flag is for.
-- A self-signed root in the presented chain is detected by testing whether the
-  last certificate issues itself, rather than by counting certificates. The
-  PowerShell version still uses the count, which misreports a cross-signed
-  intermediate as a root.
+- Both versions detect a self-signed root in the presented chain by testing
+  whether the last certificate issues itself, rather than by counting
+  certificates, so a cross-signed intermediate is not mistaken for a root.
 - Fingerprints are SHA-256, not the SHA-1 thumbprint .NET reports.
 - `--timeout` is in seconds; `-TimeoutMs` is in milliseconds.
 - The RFC 5424 timestamp omits the optional fractional seconds, because no
@@ -292,7 +291,7 @@ naming convention; the rows below say where they diverge.
 | `chainValid` | `ChainValid` | Whether the chain validated locally |
 | `verifyResult` | `PolicyErrors` | Why validation failed. OpenSSL verify code in Bash, `SslPolicyErrors` in PowerShell |
 | `wireCertCount` | `WireCertCount` | Certificates the server presented |
-| `selfSignedRootSent` | | Whether the presented chain ends in a self-signed root. Bash only |
+| `selfSignedRootSent` | `SelfSignedRootSent` | Whether the presented chain ends in a self-signed root. Set only when the wire chain was fetched; PowerShell needs `-ShowWireChain` for that |
 | `sent` | `Sent` | Payload messages written |
 | `error` | `Error` | Why the target failed, empty on success |
 
@@ -310,8 +309,9 @@ certificate as leaf followed by intermediates.
 certificate the client either already trusts or never will. Harmless for most
 clients, but some embedded TLS stacks reject it. Note that a three-certificate
 chain is not evidence of this on its own: cross-signed intermediates are common
-and entirely correct. The Bash version tests whether the last certificate issues
-itself; the PowerShell version still infers it from the count.
+and entirely correct, and `badssl.com` is one such host. Both versions test
+whether the last certificate the server sent issues itself, rather than
+inferring it from the count.
 
 **`DNS resolution for 'name' failed`** means the name never resolved, so
 nothing was contacted. Both versions check this before connecting, because a
