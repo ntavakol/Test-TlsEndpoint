@@ -46,6 +46,9 @@ no intermediate cache and do not fetch via AIA.
 # ask one DNS server rather than the system resolver
 .\Test-TlsEndpoint.ps1 www.example.com 443 -DnsServer 8.8.4.4
 
+# is it the endpoint, or is one resolver disagreeing with the other?
+.\Test-TlsEndpoint.ps1 www.example.com 443 -DnsServer 8.8.4.4 -Compare
+
 # connect by IP but validate a named certificate
 .\Test-TlsEndpoint.ps1 -ComputerName 192.0.2.10 -Port 636 -SniName dc01.example.com
 
@@ -86,6 +89,7 @@ Import-Csv .\endpoints.csv |
 | `TlsVersion` | `Auto` | `Auto`, `Tls`, `Tls11`, `Tls12`, `Tls13` |
 | `TimeoutMs` | `5000` | Connect and read timeout |
 | `DnsServer` | system resolver | Resolve against this DNS server, and connect to what it answers |
+| `Compare` | off | Also resolve through the system resolver and report both, side by side. Needs `DnsServer` |
 | `ExpiryWarningDays` | `30` | Threshold for the expiry warning |
 | `ShowWireChain` | off | Use OpenSSL to show what the server actually presents |
 | `SendSyslog` | off | Send an RFC 5424 message with RFC 5425 framing |
@@ -121,6 +125,9 @@ chmod +x test-tlsendpoint.sh
 
 # ask one DNS server rather than the system resolver
 ./test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4
+
+# is it the endpoint, or is one resolver disagreeing with the other?
+./test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4 --compare
 
 # connect by IP but validate a named certificate
 ./test-tlsendpoint.sh 192.0.2.10 636 --sni dc01.example.com
@@ -167,6 +174,7 @@ jq -r 'select(.daysLeft != null and .daysLeft < 30) | .host' report.jsonl
 | `--tls-version VER` | `auto` | `auto`, `1.0`, `1.1`, `1.2`, `1.3` |
 | `--timeout SECONDS` | `5` | Connect and read timeout |
 | `--dns-server ADDR` | system resolver | Resolve against this DNS server, and connect to what it answers |
+| `--compare` | off | Also resolve through the system resolver and report both, side by side. Needs `--dns-server` |
 | `--expiry-warning-days N` | `30` | Threshold for the expiry warning |
 | `--show-wire-chain` | off | Print every certificate the server sends, in full |
 | `--send-syslog` | off | Send an RFC 5424 message with RFC 5425 framing |
@@ -261,6 +269,27 @@ resolver would let it quietly overrule the flag. IPv4 is preferred among the
 answers, since a host with no IPv6 route otherwise fails for reasons that have
 nothing to do with the endpoint. The name being validated is still `--sni`,
 which defaults to the host, so certificate matching is unaffected.
+
+**`--compare` / `-Compare`** runs that comparison for you: it resolves through
+the system resolver as well and prints both answers side by side before the
+test proceeds.
+
+```
+--------------------------------------------------------------------
+Resolver comparison
+--------------------------------------------------------------------
+  system resolver        did not resolve
+  8.8.4.4                104.20.23.154, 172.66.147.243, 2606:4700:10::6814:179a
+The two resolvers disagree. The endpoint tested below is the one 8.8.4.4 points at.
+```
+
+Disagreement is reported, not treated as a failure: the exit code and the
+`Error` field still describe the endpoint, since a resolver that differs from
+its neighbour is often correct to. It is recorded as `resolversAgree` in the
+JSON and `ResolversAgree` on the object, alongside `systemResolved` /
+`SystemResolved`. Both are null when no comparison was asked for, which is not
+the same as a disagreement. When the two differ, the endpoint tested is the one
+`--dns-server` points at.
 
 **SAN does not match** is the single most common cause of a client connecting,
 completing the TCP handshake, then immediately resetting. If a device is

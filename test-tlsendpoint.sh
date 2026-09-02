@@ -45,6 +45,7 @@ QUIET=0
 USE_COLOR=auto
 TARGETS_FILE=''
 DNS_SERVER=''
+COMPARE=0
 
 WORKDIR=''
 WORST_EXIT=0
@@ -103,6 +104,10 @@ CONNECTION
                           than the system resolver. Takes an IP address.
                           Bypasses the hosts file: this asks what that
                           server says, which is the point of asking it.
+  --compare               Resolve through the system resolver as well and
+                          report both answers side by side. Needs
+                          --dns-server. The endpoint tested is still the one
+                          --dns-server points at.
   --expiry-warning-days N Warn when the leaf expires within N days. Default 30.
   --show-wire-chain       Print full detail of every certificate the server
                           sends, not just the summary count.
@@ -137,6 +142,7 @@ EXAMPLES
   test-tlsendpoint.sh 192.0.2.10 636 --sni dc01.example.com
   test-tlsendpoint.sh www.example.com 443 --tls-version 1.2
   test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4
+  test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4 --compare
   test-tlsendpoint.sh syslog.example.com 6514 --send-syslog --count 3
   test-tlsendpoint.sh www.example.com 443 --read-response \
       --send-raw 'GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n'
@@ -252,13 +258,17 @@ resolve_via_server() {
 # getent goes through getaddrinfo, exactly like the connect that follows, so
 # it is trusted outright; the rest are fallbacks for systems without it.
 # Returns 2, distinct from a lookup failure, when no resolver tool exists.
+# resolve_host NAME [SERVER]; SERVER defaults to --dns-server, and an empty
+# second argument forces the system resolver even when --dns-server is set,
+# which is what --compare needs.
 resolve_host() {
     local name=$1 out
+    local server=${2-$DNS_SERVER}
 
     # A named server is a question about that server, so the hosts file and
     # the system resolver are deliberately bypassed.
-    if [ -n "$DNS_SERVER" ]; then
-        resolve_via_server "$name" "$DNS_SERVER"
+    if [ -n "$server" ]; then
+        resolve_via_server "$name" "$server"
         return $?
     fi
 
@@ -348,6 +358,15 @@ json_str() {
 
 json_num() { local v=${1-}; if [ -z "$v" ]; then printf 'null'; else printf '%s' "$v"; fi; }
 
+# null when no comparison was asked for, which is not the same as a disagreement
+json_tribool() {
+    case ${1-} in
+        1) printf 'true' ;;
+        0) printf 'false' ;;
+        *) printf 'null' ;;
+    esac
+}
+
 json_bool() { if [ "${1-0}" = 1 ]; then printf 'true'; else printf 'false'; fi; }
 
 # newline-separated stdin -> JSON array of strings
@@ -379,6 +398,7 @@ parse_args() {
             --sni)                 need_value "$1" $(($# - 1)); SNI=$2; shift 2 ;;
             --tls-version|--tls)   need_value "$1" $(($# - 1)); TLS_VERSION=$(lower "$2"); shift 2 ;;
             --dns-server)          need_value "$1" $(($# - 1)); DNS_SERVER=$2; shift 2 ;;
+            --compare)             COMPARE=1; shift ;;
             --timeout)             need_value "$1" $(($# - 1)); TIMEOUT=$2; shift 2 ;;
             --expiry-warning-days) need_value "$1" $(($# - 1)); EXPIRY_WARNING_DAYS=$2; shift 2 ;;
             --show-wire-chain)     SHOW_WIRE_CHAIN=1; shift ;;
@@ -489,6 +509,9 @@ run_one() {
     : > "$sanfile"
     local addrfile="$dir/addrs.txt"
     : > "$addrfile"
+    local sysaddrfile="$dir/sysaddrs.txt"
+    : > "$sysaddrfile"
+    local r_agree=''
     local rc=$EX_OK
 
     # ------------------------------------------------------------ DNS first
@@ -512,9 +535,42 @@ run_one() {
             fi
             emit_result; note_exit $EX_DNS; return $EX_DNS
         fi
+        if [ $rrc -eq 0 ] && [ "$COMPARE" -eq 1 ]; then
+            # the system resolver's own answer, for the side-by-side
+            local sys_addrs sys_rc sys_shown
+            sys_addrs=$(resolve_host "$host" ""); sys_rc=$?
+            printf '%s\n' "$sys_addrs" | sed '/^$/d' > "$sysaddrfile"
+            if [ $sys_rc -eq 0 ] &&
+               [ "$(printf '%s\n' "$sys_addrs" | sort)" = "$(printf '%s\n' "$addrs" | sort)" ]; then
+                r_agree=1
+            else
+                r_agree=0
+            fi
+            # the verdict is settled above, because it belongs in the JSON
+            # whether or not anything is printed
+            if [ "$QUIET" -eq 0 ]; then
+                if [ $sys_rc -eq 0 ]; then
+                    sys_shown=$(printf '%s' "$sys_addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')
+                else
+                    sys_shown='did not resolve'
+                fi
+                heading "Resolver comparison"
+                say "$(printf '  %-22s %s' 'system resolver' "$sys_shown")"
+                say "$(printf '  %-22s %s' "$DNS_SERVER" \
+                    "$(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')")"
+                if [ "$r_agree" -eq 1 ]; then
+                    ok "The two resolvers agree."
+                else
+                    warn "The two resolvers disagree. The endpoint tested below is the one $DNS_SERVER points at."
+                fi
+            fi
+        fi
+
         if [ $rrc -eq 0 ]; then
             printf '%s\n' "$addrs" > "$addrfile"
-            say "Resolved $host$via to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+            # the comparison table above already showed this
+            [ "$COMPARE" -eq 0 ] &&
+                say "Resolved $host$via to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
             # A named server is only really honoured if its answer is the
             # one connected to. Leaving the connect to the system resolver
             # would let it quietly overrule the flag. IPv4 is preferred
@@ -878,6 +934,8 @@ emit_result() {
     printf '"sni":%s,'               "$(json_str "$sni")"
     printf '"dnsServer":%s,'         "$(json_str "$DNS_SERVER")"
     printf '"resolved":%s,'          "$(json_array < "$addrfile")"
+    printf '"systemResolved":%s,'    "$(json_array < "$sysaddrfile")"
+    printf '"resolversAgree":%s,'    "$(json_tribool "$r_agree")"
     printf '"tcpOpen":%s,'           "$(json_bool "$r_tcp")"
     printf '"tlsProtocol":%s,'       "$(json_str "$r_proto")"
     printf '"cipher":%s,'            "$(json_str "$r_cipher")"
@@ -936,6 +994,9 @@ main() {
     tls_flag >/dev/null    # validate --tls-version before doing any work
     if [ -n "$DNS_SERVER" ] && ! is_ip_literal "$DNS_SERVER"; then
         die "--dns-server takes an IP address, not '$DNS_SERVER'"
+    fi
+    if [ "$COMPARE" -eq 1 ] && [ -z "$DNS_SERVER" ]; then
+        die "--compare needs --dns-server: it compares that server against the system resolver"
     fi
 
     command -v openssl >/dev/null 2>&1 ||

@@ -41,6 +41,11 @@
     are bypassed, and the connect is made to the address this server
     returns, so the whole test reflects that one server's answer.
 
+.PARAMETER Compare
+    Resolve through the system resolver as well and report both answers
+    side by side. Needs DnsServer. The endpoint tested is still the one
+    DnsServer points at.
+
 .PARAMETER TlsVersion
     Protocol to offer. Auto offers everything the platform supports.
 
@@ -121,6 +126,8 @@ param(
     [string]$SniName,
 
     [string]$DnsServer,
+
+    [switch]$Compare,
 
     [ValidateSet('Auto', 'Tls', 'Tls11', 'Tls12', 'Tls13')]
     [string]$TlsVersion = 'Auto',
@@ -308,6 +315,8 @@ process {
         SniName         = $SniName
         DnsServer       = $DnsServer
         Resolved        = @()
+        SystemResolved  = @()
+        ResolversAgree  = $null
         TcpOpen         = $false
         TlsProtocol     = $null
         Cipher          = $null
@@ -339,6 +348,9 @@ process {
             throw "-DnsServer takes an IP address, not '$DnsServer'"
         }
     }
+    if ($Compare -and -not $DnsServer) {
+        throw '-Compare needs -DnsServer: it compares that server against the system resolver'
+    }
 
     $via       = if ($DnsServer) { " via $DnsServer" } else { '' }
     $connectTo = $ComputerName
@@ -361,7 +373,40 @@ process {
             return
         }
         $result.Resolved = @($addresses)
-        Write-Line ("Resolved {0}{1} to {2}" -f $ComputerName, $via, ($result.Resolved -join ', '))
+
+        if ($Compare) {
+            # the system resolver's own answer, for the side by side
+            $sysAddresses = $null
+            try {
+                $sysAddresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs
+            } catch {
+                $sysAddresses = $null
+            }
+            $result.SystemResolved = @($sysAddresses)
+            $result.ResolversAgree =
+                ($null -ne $sysAddresses) -and
+                (($sysAddresses | Sort-Object) -join ',') -eq (($addresses | Sort-Object) -join ',')
+
+            # the verdict is settled above, because it belongs on the result
+            # object whether or not anything is printed
+            if (-not $Quiet) {
+                $shown = if ($sysAddresses) { $sysAddresses -join ', ' } else { 'did not resolve' }
+                Write-Host ''
+                Write-Host $sep
+                Write-Host 'Resolver comparison'
+                Write-Host $sep
+                Write-Line ('  {0,-22} {1}' -f 'system resolver', $shown)
+                Write-Line ('  {0,-22} {1}' -f $DnsServer, ($addresses -join ', '))
+                if ($result.ResolversAgree) {
+                    Write-Line 'The two resolvers agree.' 'Green'
+                } else {
+                    Write-Line "The two resolvers disagree. The endpoint tested below is the one $DnsServer points at." 'Yellow'
+                }
+            }
+        }
+        else {
+            Write-Line ("Resolved {0}{1} to {2}" -f $ComputerName, $via, ($result.Resolved -join ', '))
+        }
 
         # A named server is only really honoured if its answer is the one
         # connected to. Leaving the connect to the system resolver would let
