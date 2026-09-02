@@ -221,6 +221,7 @@ jq -r 'select(.daysLeft != null and .daysLeft < 30) | .host' report.jsonl
 | `--quiet` | off | Suppress the human-readable report |
 | `--color WHEN` | `auto` | `auto`, `always`, `never` (also honours `NO_COLOR`) |
 | `--targets FILE` | none | Sweep many targets; `-` reads stdin |
+| `--version` | | Print the version and exit |
 
 ### Exit codes
 
@@ -258,6 +259,42 @@ With `--targets`, the exit code is the highest code any target produced.
   single `date` invocation produces them on both GNU and BSD systems.
 
 ---
+
+## Result fields
+
+`--json` emits one object per target; `-PassThru` emits the PowerShell
+equivalent. They carry largely the same information under each language's
+naming convention; the rows below say where they diverge.
+
+| Bash (`--json`) | PowerShell (`-PassThru`) | Meaning |
+|---|---|---|
+| `host` | `ComputerName` | Target as given |
+| `port` | `Port` | Target port |
+| `sni` | `SniName` | Name validated against the SAN |
+| `dnsServer` | `DnsServer` | Server used for resolution, empty when the system resolver was |
+| `resolved` | `Resolved` | Addresses the name resolved to; empty for an address literal |
+| `systemResolved` | `SystemResolved` | The system resolver's own answer, under `--compare` only |
+| `resolversAgree` | `ResolversAgree` | Whether the two agreed; null when no comparison ran |
+| `tcpOpen` | `TcpOpen` | Whether the TCP connect succeeded |
+| `tlsProtocol` | `TlsProtocol` | Negotiated protocol |
+| `cipher` | `Cipher` | Negotiated cipher |
+| `keyExchangeBits` | | Bits of the key exchange, off OpenSSL's `Server Temp Key`. Null when it reports none, which includes most TLS 1.3 sessions. Bash only |
+| | `CipherBits` | Symmetric cipher strength in bits, from `SslStream.CipherStrength`. PowerShell only |
+| `keyExchange` | `KeyExchange` | Key exchange, as each stack names it. OpenSSL's `Server Temp Key`, or the peer signature type when it gives none; .NET's `KeyExchangeAlgorithm`. The two do not share a vocabulary |
+| `subject` / `issuer` | `Subject` / `Issuer` | Leaf subject and issuer |
+| `notBefore` / `notAfter` | `NotBefore` / `NotAfter` | Leaf validity window |
+| `daysLeft` | `DaysLeft` | Days to expiry; negative once expired |
+| `signatureAlg` | `SignatureAlg` | Leaf signature algorithm |
+| `keySize` | `KeySize` | Leaf public key size in bits |
+| `fingerprintSha256` | `Thumbprint` | Leaf fingerprint. SHA-256 in Bash, SHA-1 in PowerShell |
+| `subjectAltNames` | `SubjectAltNames` | SAN entries |
+| `nameMatch` | `NameMatch` | Whether the SNI matched the SAN |
+| `chainValid` | `ChainValid` | Whether the chain validated locally |
+| `verifyResult` | `PolicyErrors` | Why validation failed. OpenSSL verify code in Bash, `SslPolicyErrors` in PowerShell |
+| `wireCertCount` | `WireCertCount` | Certificates the server presented |
+| `selfSignedRootSent` | | Whether the presented chain ends in a self-signed root. Bash only |
+| `sent` | `Sent` | Payload messages written |
+| `error` | `Error` | Why the target failed, empty on success |
 
 ## Reading the output
 
