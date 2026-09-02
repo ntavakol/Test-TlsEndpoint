@@ -420,6 +420,7 @@ process {
         ChainValid      = $false
         PolicyErrors    = $null
         WireCertCount   = $null
+        SelfSignedRootSent = $false
         Sent            = 0
         Error           = $null
     }
@@ -745,18 +746,43 @@ process {
                 foreach ($l in $lines) { Write-Line $l.Line.Trim() }
             }
 
-            $wireCount = ($output | Select-String -SimpleMatch '-----BEGIN CERTIFICATE-----').Count
+            # Counting said three or more certificates meant a root. Cross-signed
+            # intermediates are common and entirely legitimate, and produce three
+            # with no root in sight. Test the last certificate for issuing itself,
+            # which is what the Bash version does; selfSignedRootSent has to mean
+            # the same thing in both.
+            $pemBlocks = [regex]::Matches(
+                ($output -join "`n"),
+                '(?s)-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----'
+            )
+
+            $wireCount = $pemBlocks.Count
             $result.WireCertCount = $wireCount
             Write-Line "Certificates sent by server: $wireCount"
+
+            $selfSignedRootSent = $false
+            if ($wireCount -gt 0) {
+                $lastPem = $pemBlocks[$wireCount - 1].Value
+                $b64 = ($lastPem -replace '-----(BEGIN|END) CERTIFICATE-----', '') -replace '\s', ''
+                try {
+                    # the leading comma keeps the byte array one argument
+                    $lastCert = New-Object Security.Cryptography.X509Certificates.X509Certificate2(
+                                    ,[Convert]::FromBase64String($b64))
+                    $selfSignedRootSent = ($lastCert.Subject -eq $lastCert.Issuer)
+                } catch {
+                    Write-Line "Could not parse the final certificate to test for self-signing." 'Yellow'
+                }
+            }
+            $result.SelfSignedRootSent = $selfSignedRootSent
 
             if ($wireCount -le 1) {
                 Write-Line "Leaf only. Clients that do not fetch intermediates via AIA cannot build a path." 'Yellow'
                 Write-Line "Rebuild the server certificate as leaf followed by intermediates." 'Yellow'
-            } elseif ($wireCount -ge 3) {
-                Write-Line "A self-signed root appears to be included. Harmless for most clients, but" 'Yellow'
-                Write-Line "some embedded stacks reject it. Leaf plus intermediates is the correct form." 'Yellow'
+            } elseif ($selfSignedRootSent) {
+                Write-Line "The presented chain ends in a self-signed root. Harmless for most clients," 'Yellow'
+                Write-Line "but some embedded stacks reject it. Leaf plus intermediates is the correct form." 'Yellow'
             } else {
-                Write-Line "Leaf plus intermediate presented." 'Green'
+                Write-Line "Leaf plus intermediates presented, no self-signed root." 'Green'
             }
         }
     }
