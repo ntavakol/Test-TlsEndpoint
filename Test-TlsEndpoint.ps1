@@ -144,7 +144,10 @@ param(
     # --- optional payload ---------------------------------------------------
     [switch]$SendSyslog,
     [string]$Message = 'tls endpoint connectivity test',
-    [string]$SyslogHost = $env:COMPUTERNAME,
+    # COMPUTERNAME is a Windows variable; on PowerShell 7 for Linux and macOS
+    # it is unset, which emitted an empty HOSTNAME field and a doubled space,
+    # shifting every field after it and misparsing at the collector
+    [string]$SyslogHost = $(if ($env:COMPUTERNAME) { $env:COMPUTERNAME } else { [Net.Dns]::GetHostName() }),
     [string]$AppName = 'tlstest',
     [ValidateRange(0, 191)]
     [int]$Priority = 134,          # facility 16 (local0), severity 6 (info)
