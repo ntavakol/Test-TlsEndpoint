@@ -265,6 +265,71 @@ begin {
         return $null
     }
 
+    function Read-DerLength {
+        # returns @(length, octetsConsumed); length is -1 on a malformed header
+        param([byte[]]$Bytes, [int]$Index)
+
+        $first = $Bytes[$Index]
+        if ($first -lt 0x80) { return @([int]$first, 1) }
+
+        $n = $first -band 0x7F
+        if ($n -eq 0 -or $n -gt 4 -or ($Index + $n) -ge $Bytes.Length) { return @(-1, 1) }
+
+        $len = 0
+        for ($k = 1; $k -le $n; $k++) { $len = ($len -shl 8) -bor $Bytes[$Index + $k] }
+        # parenthesised: PowerShell's comma binds tighter than +, so
+        # @($len, $n + 1) parses as @($len, $n) + 1 and returns three elements
+        return @($len, ($n + 1))
+    }
+
+    # Format() is a display method and its labels are localized: DNS-Name= on
+    # German Windows, Nom DNS= on French. Matching English labels there finds
+    # nothing and reports a valid certificate as a name mismatch, which is a
+    # false negative the reader has no reason to doubt. The DER is the same
+    # everywhere.
+    function Get-SubjectAltName {
+        # SubjectAltName ::= GeneralNames ::= SEQUENCE OF GeneralName
+        # dNSName is context tag [2] (0x82), iPAddress is [7] (0x87)
+        param($Extension)
+
+        $names = @()
+        if (-not $Extension) { return $names }
+
+        $b = $Extension.RawData
+        if (-not $b -or $b.Length -lt 2 -or $b[0] -ne 0x30) { return $names }
+
+        $pos = 1
+        $hdr = Read-DerLength -Bytes $b -Index $pos
+        if ($hdr[0] -lt 0) { return $names }
+        $pos += $hdr[1]
+        $end = [Math]::Min($b.Length, $pos + $hdr[0])
+
+        while (($pos + 1) -lt $end) {
+            $tag = $b[$pos]
+            $pos++
+
+            $hdr = Read-DerLength -Bytes $b -Index $pos
+            if ($hdr[0] -lt 0) { break }
+            $pos += $hdr[1]
+            $len = $hdr[0]
+            if (($pos + $len) -gt $b.Length) { break }
+
+            if ($tag -eq 0x82) {
+                $names += [Text.Encoding]::ASCII.GetString($b, $pos, $len)
+            } elseif ($tag -eq 0x87 -and ($len -eq 4 -or $len -eq 16)) {
+                $ip = New-Object byte[] $len
+                [Array]::Copy($b, $pos, $ip, 0, $len)
+                # the leading comma keeps the byte array a single argument;
+                # without it PowerShell unrolls it onto the wrong overload
+                $names += (New-Object Net.IPAddress(, $ip)).ToString()
+            }
+
+            $pos += $len
+        }
+
+        return $names
+    }
+
     function Test-NameMatch {
         param([string[]]$Names, [string]$Expected)
 
@@ -593,15 +658,13 @@ process {
     if (-not $sanExtension) {
         Write-Line "No Subject Alternative Name extension. Most modern clients will reject this certificate." 'Red'
     } else {
-        $sanText = $sanExtension.Format($false)
-        Write-Line "SAN: $sanText"
+        $names = @(Get-SubjectAltName -Extension $sanExtension)
 
-        $names = @()
-        foreach ($part in ($sanText -split ',\s*')) {
-            if ($part -match '^(DNS Name|IP Address)\s*=\s*(.+)$') {
-                $names += $Matches[2].Trim()
-            }
+        if ($names.Count -eq 0) {
+            Write-Line "SAN extension present but contained no DNS or IP entries." 'Yellow'
         }
+
+        Write-Line ("SAN: " + ($names -join ', '))
         $result.SubjectAltNames = $names
         $result.NameMatch = Test-NameMatch -Names $names -Expected $SniName
 
