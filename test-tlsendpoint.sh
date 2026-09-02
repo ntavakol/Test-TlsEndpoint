@@ -981,7 +981,7 @@ run_targets() {
         fi
         if [ "$QUIET" -eq 0 ]; then
             [ $first -eq 0 ] && printf '\n%s\n' "$SEP"
-            printf '== %s:%s\n' "$h" "$p"
+            printf '== %s\n' "$(hostport "$h" "$p")"
         fi
         first=0
         run_one "$h" "$p"

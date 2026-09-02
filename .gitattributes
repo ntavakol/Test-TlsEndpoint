@@ -6,3 +6,7 @@
 
 *.md  text
 LICENSE text
+
+# The targets file is parsed by the shell script; keep it LF.
+*.txt text eol=lf
+*.csv text

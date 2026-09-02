@@ -1,0 +1,19 @@
+# Targets for test-tlsendpoint.sh --targets
+#
+# One "host port" per line. Blank lines and # comments are ignored.
+# "host:port" also works, but write IPv6 targets in the space-separated form
+# below: the host:port form cannot be split unambiguously.
+#
+# There is no per-line SNI here, unlike endpoints.example.csv. --sni applies to
+# every target in the run, so sweep address literals that need a name checked
+# against the SAN one at a time, or group them by name into separate files.
+
+mail.example.com 465
+syslog.example.com 6514
+
+# IPv4 literal. Add --sni dc01.example.com on the command line to validate a name.
+192.0.2.10 636
+
+# IPv6 literals, bare, with no square brackets.
+2001:db8::1 443
+2001:db8:1234:5678::a 6514

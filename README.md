@@ -73,11 +73,28 @@ no intermediate cache and do not fetch via AIA.
     Select-Object ComputerName, DaysLeft, NameMatch, ChainValid |
     Format-Table
 
-# endpoints.csv with ComputerName and Port columns
+# copy the template and edit it; endpoints.csv is gitignored so your real
+# target list never lands in a commit
+Copy-Item .\endpoints.example.csv .\endpoints.csv
+
 Import-Csv .\endpoints.csv |
     .\Test-TlsEndpoint.ps1 -Quiet -PassThru |
     Export-Csv .\tls-report.csv -NoTypeInformation
 ```
+
+`endpoints.example.csv` has the columns `ComputerName`, `Port` and `SniName`,
+and covers both address families:
+
+```csv
+ComputerName,Port,SniName,Note
+mail.example.com,465,,IPv4 by name. Leave SniName empty and it defaults to ComputerName
+192.0.2.10,636,dc01.example.com,IPv4 literal. SniName is the name checked against the SAN
+2001:db8::1,443,www.example.com,IPv6 literal. Write it bare with no square brackets
+```
+
+`SniName` is what makes an address literal worth sweeping: without it the
+literal is checked against the SAN and every such row fails on the name. Any
+further columns, `Note` here, are ignored.
 
 ### Parameters
 
@@ -154,7 +171,11 @@ produces one JSON object per line, ready for `jq`. Write IPv6 targets in the
 space-separated form (`2001:db8::1 443`), since the `host:port` form cannot be
 split unambiguously.
 
+`endpoints.example.txt` is a starting point covering both address families.
+
 ```bash
+cp endpoints.example.txt endpoints.txt   # then edit
+
 printf 'host-a.example.com 443\nhost-b.example.com 443\n' > endpoints.txt
 
 ./test-tlsendpoint.sh --targets endpoints.txt --quiet --json > report.jsonl
@@ -208,6 +229,10 @@ With `--targets`, the exit code is the highest code any target produced.
 - Both versions resolve the name before connecting, but only the Bash version
   has exit codes, so only it reports the failure as exit 5. The PowerShell
   version reports it on the object, in `Error`.
+- The CSV carries a `SniName` per row, so one sweep can mix address literals
+  that each validate a different name. `--targets` has no per-line equivalent:
+  `--sni` applies to the whole run, so literals needing a name are swept one at
+  a time or grouped into separate files.
 - The wire chain is free with OpenSSL, so the certificate count and its
   interpretation are always shown. `--show-wire-chain` adds per-certificate
   detail rather than enabling the check.

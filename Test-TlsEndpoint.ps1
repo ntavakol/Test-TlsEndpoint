@@ -123,6 +123,7 @@ param(
     [ValidateRange(1, 65535)]
     [int]$Port,
 
+    [Parameter(ValueFromPipelineByPropertyName = $true)]
     [string]$SniName,
 
     [string]$DnsServer,
@@ -421,7 +422,24 @@ process {
     }
 
     # ------------------------------------------------------------ TCP connect
-    $tcp = New-Object Net.Sockets.TcpClient
+    # The parameterless constructor makes an IPv4-only socket, which refuses
+    # every IPv6 literal with a socket address family error before a packet is
+    # sent. Match the socket to the target instead: a literal gets its own
+    # family, a name gets a dual-mode socket that accepts either.
+    $ipTarget = $null
+    if ([Net.IPAddress]::TryParse($connectTo, [ref]$ipTarget)) {
+        $tcp = New-Object Net.Sockets.TcpClient($ipTarget.AddressFamily)
+    }
+    else {
+        try {
+            $tcp = New-Object Net.Sockets.TcpClient([Net.Sockets.AddressFamily]::InterNetworkV6)
+            $tcp.Client.DualMode = $true
+        }
+        catch {
+            # no IPv6 stack at all, so IPv4 is the only thing left to try
+            $tcp = New-Object Net.Sockets.TcpClient
+        }
+    }
     try {
         $iar = $tcp.BeginConnect($connectTo, $Port, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {

@@ -1,0 +1,6 @@
+ComputerName,Port,SniName,Note
+mail.example.com,465,,IPv4 by name. Leave SniName empty and it defaults to ComputerName
+syslog.example.com,6514,,Syslog over TLS
+192.0.2.10,636,dc01.example.com,IPv4 literal. SniName is the name checked against the SAN
+2001:db8::1,443,www.example.com,IPv6 literal. Write it bare with no square brackets
+2001:db8:1234:5678::a,6514,syslog.example.com,IPv6 literal on a non-standard port
