@@ -56,6 +56,7 @@ EX_USAGE=1
 EX_TCP=2
 EX_HANDSHAKE=3
 EX_CERT=4
+EX_DNS=5
 
 SEP='--------------------------------------------------------------------'
 
@@ -123,6 +124,7 @@ OUTPUT
 
 EXIT CODES
   0 success   1 usage   2 TCP failed   3 handshake failed   4 certificate problem
+  5 name did not resolve
 
 EXAMPLES
   test-tlsendpoint.sh syslog.example.com 6514
@@ -169,6 +171,98 @@ with_timeout() {
 # the presence of -tls1_2
 openssl_supports() {
     printf '%s\n' "$OPENSSL_HELP" | grep -qE -- "(^|[[:space:]])$1([[:space:]]|$)"
+}
+
+# an address literal is already resolved; anything else is a name
+is_ip_literal() {
+    case $1 in
+        *:*)                         return 0 ;;   # IPv6
+        *[!0-9.]*)                   return 1 ;;
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*) return 0 ;;   # IPv4 dotted quad
+        *)                           return 1 ;;
+    esac
+}
+
+# addresses recorded for a name in the hosts file. Consulted first because the
+# DNS-only fallbacks below cannot see it, and a name defined only there
+# resolves perfectly well for the connect that follows.
+hosts_file_lookup() {
+    local name=$1 f win
+    set -- /etc/hosts
+    if command -v cygpath >/dev/null 2>&1 && [ -n "${SYSTEMROOT-}" ]; then
+        win=$(cygpath -u "$SYSTEMROOT" 2>/dev/null) &&
+            set -- "$@" "$win/System32/drivers/etc/hosts"
+    fi
+    for f in "$@"; do
+        [ -r "$f" ] || continue
+        awk -v n="$(lower "$name")" '
+            { sub(/#.*/, "") }
+            NF < 2 { next }
+            { for (i = 2; i <= NF; i++) if (tolower($i) == n) { print $1; next } }
+        ' "$f" 2>/dev/null
+    done
+}
+
+# Addresses for a name, one per line, empty output if it does not resolve.
+# getent goes through getaddrinfo, exactly like the connect that follows, so
+# it is trusted outright; the rest are fallbacks for systems without it.
+# Returns 2, distinct from a lookup failure, when no resolver tool exists.
+resolve_host() {
+    local name=$1 out
+
+    out=$(hosts_file_lookup "$name")
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+
+    if command -v getent >/dev/null 2>&1; then
+        out=$(with_timeout "$TIMEOUT" getent ahosts "$name" 2>/dev/null | awk '{print $1}')
+        [ -z "$out" ] &&
+            out=$(with_timeout "$TIMEOUT" getent hosts "$name" 2>/dev/null | awk '{print $1}')
+        out=$(printf '%s\n' "$out" | sort -u | sed '/^$/d')
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+
+    if command -v dscacheutil >/dev/null 2>&1; then     # macOS
+        out=$(with_timeout "$TIMEOUT" dscacheutil -q host -a name "$name" 2>/dev/null |
+              sed -n 's/^ipv*6*_address: *//p' | sort -u)
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+
+    if command -v dig >/dev/null 2>&1; then
+        out=$( { with_timeout "$TIMEOUT" dig +short -t A    "$name" 2>/dev/null
+                 with_timeout "$TIMEOUT" dig +short -t AAAA "$name" 2>/dev/null
+               } | grep -E '^[0-9a-fA-F.:]+$' | sort -u)
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+
+    if command -v host >/dev/null 2>&1; then
+        out=$(with_timeout "$TIMEOUT" host "$name" 2>/dev/null |
+              sed -n 's/.* has \(IPv6 \)*address //p' | sort -u)
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+
+    if command -v nslookup >/dev/null 2>&1; then
+        # skip the resolver's own address, which precedes the first Name: line
+        out=$(with_timeout "$TIMEOUT" nslookup "$name" 2>/dev/null | awk '
+            /^Name:/ { seen = 1; cont = 0; next }
+            seen && /^Address(es)?:/ {
+                sub(/^Address(es)?:[[:space:]]*/, ""); cont = 1
+                if ($0 != "") print
+                next
+            }
+            seen && cont && /^[[:space:]]+[0-9a-fA-F.:]+[[:space:]]*$/ {
+                gsub(/[[:space:]]/, ""); print; next
+            }
+            { cont = 0 }
+        ' | sort -u)
+        [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+        return 1
+    fi
+
+    return 2
 }
 
 # "host:port", bracketing bare IPv6 literals
@@ -351,7 +445,29 @@ run_one() {
     local r_error=''
     local sanfile="$dir/san.txt"
     : > "$sanfile"
+    local addrfile="$dir/addrs.txt"
+    : > "$addrfile"
     local rc=$EX_OK
+
+    # ------------------------------------------------------------ DNS first
+    # A name that does not resolve can never connect, and reporting that as a
+    # refused connection sends the reader after a firewall that is not there.
+    if ! is_ip_literal "$host"; then
+        local addrs rrc
+        addrs=$(resolve_host "$host"); rrc=$?
+        if [ $rrc -eq 1 ]; then
+            r_error="DNS resolution failed: '$host' did not resolve"
+            bad "DNS resolution for '$host' failed. The name did not resolve, so the service was never contacted."
+            warn "Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone."
+            emit_result; note_exit $EX_DNS; return $EX_DNS
+        fi
+        if [ $rrc -eq 0 ]; then
+            printf '%s\n' "$addrs" > "$addrfile"
+            say "Resolved $host to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+        fi
+        # rrc 2 means no resolver tool was found; say nothing and let the
+        # connect below speak for itself
+    fi
 
     # -------------------------------------------------------- TCP reachable
     if with_timeout "$TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1; then
@@ -699,6 +815,7 @@ emit_result() {
     printf '"host":%s,'              "$(json_str "$host")"
     printf '"port":%s,'              "$(json_num "$port")"
     printf '"sni":%s,'               "$(json_str "$sni")"
+    printf '"resolved":%s,'          "$(json_array < "$addrfile")"
     printf '"tcpOpen":%s,'           "$(json_bool "$r_tcp")"
     printf '"tlsProtocol":%s,'       "$(json_str "$r_proto")"
     printf '"cipher":%s,'            "$(json_str "$r_cipher")"

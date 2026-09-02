@@ -183,11 +183,14 @@ jq -r 'select(.daysLeft != null and .daysLeft < 30) | .host' report.jsonl
 | 2 | TCP connect failed |
 | 3 | TLS handshake failed |
 | 4 | Certificate problem: expired, not yet valid, no SAN, name mismatch, or chain did not validate |
+| 5 | Name did not resolve (Bash only) |
 
 With `--targets`, the exit code is the highest code any target produced.
 
 ### Differences from the PowerShell version
 
+- The Bash version resolves the name before connecting and reports a DNS
+  failure as exit 5. The PowerShell version reports it as a failed connection.
 - The wire chain is free with OpenSSL, so the certificate count and its
   interpretation are always shown. `--show-wire-chain` adds per-certificate
   detail rather than enabling the check.
@@ -221,6 +224,17 @@ clients, but some embedded TLS stacks reject it. Note that a three-certificate
 chain is not evidence of this on its own: cross-signed intermediates are common
 and entirely correct. The Bash version tests whether the last certificate issues
 itself; the PowerShell version still infers it from the count.
+
+**`DNS resolution for 'name' failed`** means the name never resolved, so
+nothing was contacted. The Bash version checks this before connecting, because
+a name that does not resolve is otherwise indistinguishable from a refused
+connection, and the two send you to opposite places: the resolver rather than
+the endpoint. The check consults the hosts file first, then `getent`, which
+goes through `getaddrinfo` exactly like the connect that follows, then falls
+back to `dscacheutil`, `dig`, `host` or `nslookup`. If none of those exist it
+is skipped rather than guessed at. Resolved addresses are reported on success,
+which is also how you catch a stale record or a split-horizon zone handing you
+the wrong host.
 
 **SAN does not match** is the single most common cause of a client connecting,
 completing the TCP handshake, then immediately resetting. If a device is
