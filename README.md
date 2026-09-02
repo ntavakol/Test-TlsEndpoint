@@ -189,8 +189,9 @@ With `--targets`, the exit code is the highest code any target produced.
 
 ### Differences from the PowerShell version
 
-- The Bash version resolves the name before connecting and reports a DNS
-  failure as exit 5. The PowerShell version reports it as a failed connection.
+- Both versions resolve the name before connecting, but only the Bash version
+  has exit codes, so only it reports the failure as exit 5. The PowerShell
+  version reports it on the object, in `Error`.
 - The wire chain is free with OpenSSL, so the certificate count and its
   interpretation are always shown. `--show-wire-chain` adds per-certificate
   detail rather than enabling the check.
@@ -226,15 +227,22 @@ and entirely correct. The Bash version tests whether the last certificate issues
 itself; the PowerShell version still infers it from the count.
 
 **`DNS resolution for 'name' failed`** means the name never resolved, so
-nothing was contacted. The Bash version checks this before connecting, because
-a name that does not resolve is otherwise indistinguishable from a refused
+nothing was contacted. Both versions check this before connecting, because a
+name that does not resolve is otherwise indistinguishable from a refused
 connection, and the two send you to opposite places: the resolver rather than
-the endpoint. The check consults the hosts file first, then `getent`, which
-goes through `getaddrinfo` exactly like the connect that follows, then falls
-back to `dscacheutil`, `dig`, `host` or `nslookup`. If none of those exist it
-is skipped rather than guessed at. Resolved addresses are reported on success,
-which is also how you catch a stale record or a split-horizon zone handing you
-the wrong host.
+the endpoint.
+
+PowerShell uses `Dns.GetHostAddresses`, which goes through `getaddrinfo` and so
+honours the hosts file and the configured resolvers exactly as the connect that
+follows will. Bash has no single equivalent, so it consults the hosts file
+first, then `getent`, which is the same `getaddrinfo` path, and falls back to
+`dscacheutil`, `dig`, `host` or `nslookup`. Those fallbacks query DNS directly
+and cannot see the hosts file, which is why it is read ahead of them. Where
+none of them exist the check is skipped rather than guessed at.
+
+Address literals skip the lookup. Resolved addresses are reported on success
+and carried on the result, which is also how you catch a stale record or a
+split-horizon zone handing you the wrong host.
 
 **SAN does not match** is the single most common cause of a client connecting,
 completing the TCP handshake, then immediately resetting. If a device is

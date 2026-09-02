@@ -151,6 +151,25 @@ begin {
         else         { Write-Host $Text }
     }
 
+    # Addresses for a name, or a throw explaining why there are none.
+    # Dns.GetHostAddresses goes through getaddrinfo, so the hosts file and the
+    # configured resolvers are honoured exactly as the connect that follows
+    # will honour them. The async form is used only to bound the wait; the
+    # synchronous overload takes no timeout.
+    function Resolve-TargetAddress {
+        param([string]$Name, [int]$TimeoutMs)
+
+        $task = [Net.Dns]::GetHostAddressesAsync($Name)
+        if (-not $task.Wait($TimeoutMs)) {
+            throw "timed out after $TimeoutMs ms"
+        }
+        $addresses = @($task.Result)
+        if ($addresses.Count -eq 0) {
+            throw 'the resolver returned no addresses'
+        }
+        return $addresses
+    }
+
     function Get-SslProtocolSet {
         param([string]$Requested)
 
@@ -241,6 +260,7 @@ process {
         ComputerName    = $ComputerName
         Port            = $Port
         SniName         = $SniName
+        Resolved        = @()
         TcpOpen         = $false
         TlsProtocol     = $null
         Cipher          = $null
@@ -261,6 +281,27 @@ process {
         WireCertCount   = $null
         Sent            = 0
         Error           = $null
+    }
+
+    # ------------------------------------------------------------- DNS first
+    # A name that does not resolve can never connect, and reporting that as a
+    # refused connection sends the reader after a firewall that is not there.
+    $ipLiteral = $null
+    if (-not [Net.IPAddress]::TryParse($ComputerName, [ref]$ipLiteral)) {
+        try {
+            $addresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs
+        } catch {
+            $reason = $_.Exception
+            while ($reason.InnerException) { $reason = $reason.InnerException }
+            $result.Error = "DNS resolution failed: '$ComputerName' did not resolve"
+            Write-Line "DNS resolution for '$ComputerName' failed: $($reason.Message)" 'Red'
+            Write-Line 'The name did not resolve, so the service was never contacted.' 'Red'
+            Write-Line 'Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone.' 'Yellow'
+            if ($PassThru) { $result }
+            return
+        }
+        $result.Resolved = @($addresses | ForEach-Object { $_.IPAddressToString })
+        Write-Line ("Resolved {0} to {1}" -f $ComputerName, ($result.Resolved -join ', '))
     }
 
     # ------------------------------------------------------------ TCP connect
