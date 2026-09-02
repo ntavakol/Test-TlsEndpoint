@@ -201,10 +201,16 @@ begin {
                 $async = $shell.BeginInvoke()
                 if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
                     # Stop() and Dispose() both block until the query gives up,
-                    # which is the wait -TimeoutMs exists to cut short. Abandon
-                    # the runspace instead; the process reclaims it on exit.
+                    # which is the wait -TimeoutMs exists to cut short. Stop it
+                    # asynchronously and dispose from the callback, so a sweep
+                    # against a dead server does not pile up runspaces.
                     $timedOut = $true
-                    $null = $shell.BeginStop($null, $null)
+                    $doomed   = $shell
+                    $null = $doomed.BeginStop({
+                        param($ar)
+                        try { $doomed.EndStop($ar) } catch { }
+                        try { $doomed.Dispose() }   catch { }
+                    }, $null)
                     throw "timed out after $TimeoutMs ms"
                 }
                 $records = $shell.EndInvoke($async)
@@ -348,6 +354,10 @@ process {
         if (-not [Net.IPAddress]::TryParse($DnsServer, [ref]$probe)) {
             throw "-DnsServer takes an IP address, not '$DnsServer'"
         }
+        if ($probe.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+            $probe.ToString() -ne $DnsServer) {
+            throw "-DnsServer '$DnsServer' is not a full IPv4 address; it would be read as $probe"
+        }
     }
     if ($Compare -and -not $DnsServer) {
         throw '-Compare needs -DnsServer: it compares that server against the system resolver'
@@ -357,13 +367,59 @@ process {
     $connectTo = $ComputerName
     $ipLiteral = $null
     if (-not [Net.IPAddress]::TryParse($ComputerName, [ref]$ipLiteral)) {
+        $addresses = $null
+        $failure   = $null
         try {
             $addresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs -Server $DnsServer
         } catch {
             $reason = $_.Exception
             while ($reason.InnerException) { $reason = $reason.InnerException }
+            $failure = $reason.Message
+        }
+        $result.Resolved = @($addresses)
+
+        # The comparison runs whether or not the named server answered. One
+        # resolver failing where the other does not is the case most worth
+        # seeing, so it cannot sit behind the early return below.
+        if ($Compare) {
+            $sysAddresses = $null
+            try {
+                $sysAddresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs
+            } catch {
+                $sysAddresses = $null
+            }
+            $result.SystemResolved = @($sysAddresses)
+            if ($sysAddresses -and $addresses) {
+                $result.ResolversAgree =
+                    (($sysAddresses | Sort-Object) -join ',') -eq (($addresses | Sort-Object) -join ',')
+            }
+            else {
+                # neither answering is agreement; one answering is not
+                $result.ResolversAgree = (-not $sysAddresses) -and (-not $addresses)
+            }
+
+            if (-not $Quiet) {
+                $shownSys = if ($sysAddresses) { $sysAddresses -join ', ' } else { 'did not resolve' }
+                $shownSrv = if ($addresses)    { $addresses -join ', ' }    else { 'did not resolve' }
+                Write-Host ''
+                Write-Host $sep
+                Write-Host 'Resolver comparison'
+                Write-Host $sep
+                Write-Line ('  {0,-22} {1}' -f 'system resolver', $shownSys)
+                Write-Line ('  {0,-22} {1}' -f $DnsServer, $shownSrv)
+                if ($result.ResolversAgree) {
+                    Write-Line 'The two resolvers agree.' 'Green'
+                } elseif ($addresses) {
+                    Write-Line "The two resolvers disagree. The endpoint tested below is the one $DnsServer points at." 'Yellow'
+                } else {
+                    Write-Line "The two resolvers disagree, and $DnsServer is the one that failed." 'Yellow'
+                }
+            }
+        }
+
+        if ($failure) {
             $result.Error = "DNS resolution failed: '$ComputerName' did not resolve$via"
-            Write-Line "DNS resolution for '$ComputerName'$via failed: $($reason.Message)" 'Red'
+            Write-Line "DNS resolution for '$ComputerName'$via failed: $failure" 'Red'
             Write-Line 'The name did not resolve, so the service was never contacted.' 'Red'
             if ($DnsServer) {
                 Write-Line "That is the answer from $DnsServer alone. Another resolver may well differ." 'Yellow'
@@ -373,39 +429,8 @@ process {
             if ($PassThru) { $result }
             return
         }
-        $result.Resolved = @($addresses)
 
-        if ($Compare) {
-            # the system resolver's own answer, for the side by side
-            $sysAddresses = $null
-            try {
-                $sysAddresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs
-            } catch {
-                $sysAddresses = $null
-            }
-            $result.SystemResolved = @($sysAddresses)
-            $result.ResolversAgree =
-                ($null -ne $sysAddresses) -and
-                (($sysAddresses | Sort-Object) -join ',') -eq (($addresses | Sort-Object) -join ',')
-
-            # the verdict is settled above, because it belongs on the result
-            # object whether or not anything is printed
-            if (-not $Quiet) {
-                $shown = if ($sysAddresses) { $sysAddresses -join ', ' } else { 'did not resolve' }
-                Write-Host ''
-                Write-Host $sep
-                Write-Host 'Resolver comparison'
-                Write-Host $sep
-                Write-Line ('  {0,-22} {1}' -f 'system resolver', $shown)
-                Write-Line ('  {0,-22} {1}' -f $DnsServer, ($addresses -join ', '))
-                if ($result.ResolversAgree) {
-                    Write-Line 'The two resolvers agree.' 'Green'
-                } else {
-                    Write-Line "The two resolvers disagree. The endpoint tested below is the one $DnsServer points at." 'Yellow'
-                }
-            }
-        }
-        else {
+        if (-not $Compare) {
             Write-Line ("Resolved {0}{1} to {2}" -f $ComputerName, $via, ($result.Resolved -join ', '))
         }
 

@@ -354,6 +354,9 @@ Resolver comparison
 The two resolvers disagree. The endpoint tested below is the one 8.8.4.4 points at.
 ```
 
+The comparison runs whether or not the named server answered, since one
+resolver failing where the other does not is the case most worth seeing.
+
 Disagreement is reported, not treated as a failure: the exit code and the
 `Error` field still describe the endpoint, since a resolver that differs from
 its neighbour is often correct to. It is recorded as `resolversAgree` in the
@@ -361,6 +364,19 @@ JSON and `ResolversAgree` on the object, alongside `systemResolved` /
 `SystemResolved`. Both are null when no comparison was asked for, which is not
 the same as a disagreement. When the two differ, the endpoint tested is the one
 `--dns-server` points at.
+
+**`Could not query <server>`** means the resolver tool would not use the
+server it was given and answered from a different one. `nslookup` does this
+quietly: it prints a line about the server it could not reach and then hands
+back the default resolver's answer, which the Bash version would otherwise
+report as though the named server had said it. Nothing is reported for the
+named server instead, because a diagnostic that misattributes an answer is
+worse than one that admits it has none. `dig` or `host` on PATH avoids the
+situation, both being used in preference to `nslookup`.
+
+**`No reply from <server>`** is silence, distinct from the name not existing.
+An unreachable server and a server that says NXDOMAIN mean opposite things, and
+only one of them is about the name you asked for.
 
 **SAN does not match** is the single most common cause of a client connecting,
 completing the TCP handshake, then immediately resetting. If a device is

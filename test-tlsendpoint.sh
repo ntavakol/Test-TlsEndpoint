@@ -189,15 +189,34 @@ openssl_supports() {
     printf '%s\n' "$OPENSSL_HELP" | grep -qE -- "(^|[[:space:]])$1([[:space:]]|$)"
 }
 
-# an address literal is already resolved; anything else is a name
-is_ip_literal() {
+# four decimal octets, each in range
+is_ipv4() {
+    local addr=$1 o
+    case $addr in *[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+    local IFS=.
+    set -- $addr
+    [ $# -eq 4 ] || return 1
+    for o in "$@"; do
+        [ -n "$o" ] || return 1
+        [ "${#o}" -le 3 ] || return 1
+        [ "$o" -le 255 ] || return 1
+    done
+    return 0
+}
+
+# hex groups and colons. Not a full RFC 4291 parse, which needs more code than
+# it earns here; it is strict enough that a shell metacharacter cannot pass as
+# an address, which is what this guards.
+is_ipv6() {
     case $1 in
-        *:*)                         return 0 ;;   # IPv6
-        *[!0-9.]*)                   return 1 ;;
-        [0-9]*.[0-9]*.[0-9]*.[0-9]*) return 0 ;;   # IPv4 dotted quad
-        *)                           return 1 ;;
+        *[!0-9A-Fa-f:]*) return 1 ;;
+        *:*)             return 0 ;;
+        *)               return 1 ;;
     esac
 }
+
+# an address literal is already resolved; anything else is a name
+is_ip_literal() { is_ipv4 "$1" || is_ipv6 "$1"; }
 
 # addresses recorded for a name in the hosts file. Consulted first because the
 # DNS-only fallbacks below cannot see it, and a name defined only there
@@ -217,6 +236,22 @@ hosts_file_lookup() {
             { for (i = 2; i <= NF; i++) if (tolower($i) == n) { print $1; next } }
         ' "$f" 2>/dev/null
     done
+}
+
+# "a, b, c" from newline-separated addresses
+join_addrs() { printf '%s' "$1" | tr '\n' ' ' | sed 's/ $//; s/ /, /g'; }
+
+# the resolver nslookup actually used, read from the header it prints ahead of
+# the first Name: line
+nslookup_server_used() {
+    awk '
+        /^Name:/ { exit }
+        /^Address(es)?:/ {
+            sub(/^Address(es)?:[[:space:]]*/, ""); sub(/#.*/, "")
+            gsub(/[[:space:]]/, "")
+            if ($0 != "") { print; exit }
+        }
+    '
 }
 
 # addresses out of an nslookup answer, skipping the resolver's own address,
@@ -240,21 +275,46 @@ nslookup_addresses() {
 # which is a configuration error rather than a lookup failure: quietly falling
 # back to the system resolver would answer a different question than the one
 # asked.
+# 0 resolved, 1 no such name, 3 no tool for the job, 4 the named server was
+# not the one that answered, 5 the named server never answered. stderr is kept
+# because the tools report a dead server there and on stdout inconsistently.
 resolve_via_server() {
-    local name=$1 server=$2 out
+    local name=$1 server=$2 out raw rc=0 used
     if command -v dig >/dev/null 2>&1; then
-        out=$( { with_timeout "$TIMEOUT" dig +short "@$server" -t A    "$name" 2>/dev/null
-                 with_timeout "$TIMEOUT" dig +short "@$server" -t AAAA "$name" 2>/dev/null
-               } | grep -E '^[0-9a-fA-F.:]+$' | sort -u)
+        raw=$( { with_timeout "$TIMEOUT" dig +short "@$server" -t A    "$name"
+                 with_timeout "$TIMEOUT" dig +short "@$server" -t AAAA "$name"
+               } 2>&1 ); rc=$?
+        out=$(printf '%s\n' "$raw" | grep -E '^[0-9a-fA-F.:]+$' | sort -u)
     elif command -v host >/dev/null 2>&1; then
-        out=$(with_timeout "$TIMEOUT" host "$name" "$server" 2>/dev/null |
-              sed -n 's/.* has \(IPv6 \)*address //p' | sort -u)
+        raw=$(with_timeout "$TIMEOUT" host "$name" "$server" 2>&1); rc=$?
+        out=$(printf '%s\n' "$raw" | sed -n 's/.* has \(IPv6 \)*address //p' | sort -u)
     elif command -v nslookup >/dev/null 2>&1; then
-        out=$(with_timeout "$TIMEOUT" nslookup "$name" "$server" 2>/dev/null | nslookup_addresses)
+        raw=$(with_timeout "$TIMEOUT" nslookup "$name" "$server" 2>&1); rc=$?
+        # nslookup answers from the default resolver when it cannot use the
+        # server it was handed, and says so only in a line above the answer.
+        # Reporting that answer as the named server's would be a lie, and
+        # saying which resolver said what is the whole point of the flag.
+        case $raw in
+            *"Can't find server address"*|*"can't find server address"*) return 4 ;;
+        esac
+        used=$(printf '%s\n' "$raw" | nslookup_server_used)
+        if [ -n "$used" ] && [ "$(lower "$used")" != "$(lower "$server")" ]; then
+            return 4
+        fi
+        out=$(printf '%s\n' "$raw" | nslookup_addresses)
     else
         return 3
     fi
+
     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+
+    # 124 is timeout(1) killing the query, 9 is dig giving up on its own, and
+    # nslookup exits 0 whatever happens, so its text is the only signal left
+    [ "$rc" -eq 124 ] || [ "$rc" -eq 9 ] && return 5
+    case $raw in
+        *"timed out"*|*"timed-out"*|*"no servers could be reached"*|\
+        *"No response from server"*|*"connection refused"*) return 5 ;;
+    esac
     return 1
 }
 
@@ -530,6 +590,56 @@ run_one() {
         if [ $rrc -eq 3 ]; then
             die "--dns-server needs dig, host or nslookup on PATH"
         fi
+
+        # The comparison runs whether or not the named server answered. One
+        # resolver failing where the other does not is the case most worth
+        # seeing, so it must not be skipped on the way to reporting a failure.
+        if [ "$COMPARE" -eq 1 ]; then
+            local sys_addrs sys_rc sys_shown srv_shown
+            sys_addrs=$(resolve_host "$host" ""); sys_rc=$?
+            printf '%s\n' "$sys_addrs" | sed '/^$/d' > "$sysaddrfile"
+            if [ $sys_rc -eq 0 ] && [ $rrc -eq 0 ]; then
+                if [ "$(printf '%s\n' "$sys_addrs" | sort)" = "$(printf '%s\n' "$addrs" | sort)" ]; then
+                    r_agree=1
+                else
+                    r_agree=0
+                fi
+            elif [ $sys_rc -eq 1 ] && [ $rrc -eq 1 ]; then
+                r_agree=1        # both say no such name, which is agreement
+            else
+                r_agree=0
+            fi
+            # the verdict is settled above, because it belongs in the JSON
+            # whether or not anything is printed
+            if [ "$QUIET" -eq 0 ]; then
+                if [ $sys_rc -eq 0 ]; then sys_shown=$(join_addrs "$sys_addrs")
+                else                       sys_shown='did not resolve'; fi
+                if [ $rrc -eq 0 ]; then    srv_shown=$(join_addrs "$addrs")
+                else                       srv_shown='did not resolve'; fi
+                heading "Resolver comparison"
+                say "$(printf '  %-22s %s' 'system resolver' "$sys_shown")"
+                say "$(printf '  %-22s %s' "$DNS_SERVER" "$srv_shown")"
+                if [ "$r_agree" -eq 1 ]; then
+                    ok "The two resolvers agree."
+                elif [ $rrc -eq 0 ]; then
+                    warn "The two resolvers disagree. The endpoint tested below is the one $DNS_SERVER points at."
+                else
+                    warn "The two resolvers disagree, and $DNS_SERVER is the one that failed."
+                fi
+            fi
+        fi
+
+        if [ $rrc -eq 4 ]; then
+            r_error="DNS server unusable: $DNS_SERVER did not answer for itself"
+            bad "Could not query $DNS_SERVER: the resolver fell back to a different server."
+            warn "No address is reported rather than one from somewhere else, which would not be its answer."
+            emit_result; note_exit $EX_DNS; return $EX_DNS
+        fi
+        if [ $rrc -eq 5 ]; then
+            r_error="DNS server did not answer: no reply from $DNS_SERVER within ${TIMEOUT}s"
+            bad "No reply from $DNS_SERVER within ${TIMEOUT}s. This is silence, not an answer that the name does not exist."
+            emit_result; note_exit $EX_DNS; return $EX_DNS
+        fi
         if [ $rrc -eq 1 ]; then
             r_error="DNS resolution failed: '$host' did not resolve${via}"
             bad "DNS resolution for '$host'$via failed. The name did not resolve, so the service was never contacted."
@@ -540,42 +650,12 @@ run_one() {
             fi
             emit_result; note_exit $EX_DNS; return $EX_DNS
         fi
-        if [ $rrc -eq 0 ] && [ "$COMPARE" -eq 1 ]; then
-            # the system resolver's own answer, for the side-by-side
-            local sys_addrs sys_rc sys_shown
-            sys_addrs=$(resolve_host "$host" ""); sys_rc=$?
-            printf '%s\n' "$sys_addrs" | sed '/^$/d' > "$sysaddrfile"
-            if [ $sys_rc -eq 0 ] &&
-               [ "$(printf '%s\n' "$sys_addrs" | sort)" = "$(printf '%s\n' "$addrs" | sort)" ]; then
-                r_agree=1
-            else
-                r_agree=0
-            fi
-            # the verdict is settled above, because it belongs in the JSON
-            # whether or not anything is printed
-            if [ "$QUIET" -eq 0 ]; then
-                if [ $sys_rc -eq 0 ]; then
-                    sys_shown=$(printf '%s' "$sys_addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')
-                else
-                    sys_shown='did not resolve'
-                fi
-                heading "Resolver comparison"
-                say "$(printf '  %-22s %s' 'system resolver' "$sys_shown")"
-                say "$(printf '  %-22s %s' "$DNS_SERVER" \
-                    "$(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')")"
-                if [ "$r_agree" -eq 1 ]; then
-                    ok "The two resolvers agree."
-                else
-                    warn "The two resolvers disagree. The endpoint tested below is the one $DNS_SERVER points at."
-                fi
-            fi
-        fi
 
         if [ $rrc -eq 0 ]; then
             printf '%s\n' "$addrs" > "$addrfile"
             # the comparison table above already showed this
             [ "$COMPARE" -eq 0 ] &&
-                say "Resolved $host$via to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+                say "Resolved $host$via to $(join_addrs "$addrs")"
             # A named server is only really honoured if its answer is the
             # one connected to. Leaving the connect to the system resolver
             # would let it quietly overrule the flag. IPv4 is preferred
