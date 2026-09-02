@@ -1,0 +1,22 @@
+# certificates and keys
+*.pem
+*.crt
+*.cer
+*.key
+*.pfx
+*.p12
+
+# packet captures
+*.pcap
+*.pcapng
+
+# script input and output
+endpoints.csv
+tls-report.csv
+*.log
+
+# editor and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
