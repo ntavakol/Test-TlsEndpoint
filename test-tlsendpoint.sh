@@ -128,7 +128,11 @@ OUTPUT
   --quiet                 Suppress the human-readable report.
   --color WHEN            auto (default), always, never.
   --targets FILE          Read targets from FILE, one "host port" or
-                          "host:port" per line. Use - for stdin.
+                          "host:port" per line. Use - for stdin. On the
+                          space-separated form a third field sets the SNI
+                          for that target alone, which is how one sweep
+                          validates a different name on each address
+                          literal: "192.0.2.10 636 dc01.example.com".
   -h, --help              This help.
   --version               Print version.
 
@@ -492,7 +496,8 @@ issuer_of()  { openssl x509 -noout -issuer  -nameopt RFC2253 -in "$1" 2>/dev/nul
 # ------------------------------------------------------------------- probe
 run_one() {
     local host=$1 port=$2
-    local sni=${SNI:-$host}
+    # a per-target name beats --sni, which beats the host itself
+    local sni=${3:-${SNI:-$host}}
     local connect=$host
     local target; target=$(hostport "$host" "$port")
     local dir="$WORKDIR/target-$$-$RANDOM"
@@ -962,18 +967,31 @@ emit_result() {
 
 # --------------------------------------------------------------------- main
 run_targets() {
-    local src=$TARGETS_FILE line h p first=1
+    local src=$TARGETS_FILE line h p s f1 f2 f3 _rest first=1
     [ "$src" = '-' ] && src=/dev/stdin
     [ -r "$src" ] || die "cannot read targets file '$TARGETS_FILE'"
     while IFS= read -r line || [ -n "$line" ]; do
         line=${line%%#*}
         line=$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
         [ -z "$line" ] && continue
-        case $line in
-            *[[:space:]]*) h=${line%%[[:space:]]*}; p=${line##*[[:space:]]} ;;
-            *:*)           h=${line%:*};            p=${line##*:} ;;
-            *)             h=$line;                 p=${PORT_ARG:-443} ;;
-        esac
+        # host port [sni] | host:port | host
+        read -r f1 f2 f3 _rest <<EOF
+$line
+EOF
+        if [ -n "$_rest" ]; then
+            bad "skipping '$line': too many fields, expected 'host port [sni]'"
+            note_exit $EX_USAGE
+            continue
+        fi
+        s=''
+        if [ -n "$f2" ]; then
+            h=$f1; p=$f2; s=$f3
+        else
+            case $f1 in
+                *:*) h=${f1%:*}; p=${f1##*:} ;;
+                *)   h=$f1;      p=${PORT_ARG:-443} ;;
+            esac
+        fi
         if ! is_uint "$p"; then
             bad "skipping '$line': port is not a number"
             note_exit $EX_USAGE
@@ -984,7 +1002,7 @@ run_targets() {
             printf '== %s\n' "$(hostport "$h" "$p")"
         fi
         first=0
-        run_one "$h" "$p"
+        run_one "$h" "$p" "$s"
     done < "$src"
 }
 

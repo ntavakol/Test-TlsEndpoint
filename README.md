@@ -171,6 +171,17 @@ produces one JSON object per line, ready for `jq`. Write IPv6 targets in the
 space-separated form (`2001:db8::1 443`), since the `host:port` form cannot be
 split unambiguously.
 
+A third field sets the SNI for that target alone, which is what lets one sweep
+check a different name on each address literal:
+
+```
+192.0.2.10 636 dc01.example.com
+2001:db8::1 443 www.example.com
+```
+
+A per-line name beats `--sni`, which beats the host itself. So `--sni` sets the
+name for a whole sweep, and any line may override it.
+
 `endpoints.example.txt` is a starting point covering both address families.
 
 ```bash
@@ -229,10 +240,8 @@ With `--targets`, the exit code is the highest code any target produced.
 - Both versions resolve the name before connecting, but only the Bash version
   has exit codes, so only it reports the failure as exit 5. The PowerShell
   version reports it on the object, in `Error`.
-- The CSV carries a `SniName` per row, so one sweep can mix address literals
-  that each validate a different name. `--targets` has no per-line equivalent:
-  `--sni` applies to the whole run, so literals needing a name are swept one at
-  a time or grouped into separate files.
+- Both bulk formats carry a name per target: `SniName` as a CSV column,
+  and a third field on a `--targets` line.
 - The wire chain is free with OpenSSL, so the certificate count and its
   interpretation are always shown. `--show-wire-chain` adds per-certificate
   detail rather than enabling the check.
