@@ -1,4 +1,4 @@
-# Test-TlsEndpoint
+# Test-TlsEndpoint: TLS diagnostics in PowerShell and Bash
 
 Single-file TLS diagnostics for any TCP service, in **PowerShell** and **Bash**.
 
