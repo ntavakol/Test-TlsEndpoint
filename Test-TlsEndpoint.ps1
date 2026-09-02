@@ -333,8 +333,21 @@ begin {
     function Test-NameMatch {
         param([string[]]$Names, [string]$Expected)
 
+        # 2001:0db8::1 and 2001:db8::1 are one address written two ways, and
+        # string equality says otherwise. Parsed once here rather than per SAN.
+        $expectedIp = $null
+        [void][Net.IPAddress]::TryParse($Expected, [ref]$expectedIp)
+
         foreach ($n in $Names) {
             if ($n -ieq $Expected) { return $true }
+
+            if ($expectedIp) {
+                $sanIp = $null
+                if ([Net.IPAddress]::TryParse($n, [ref]$sanIp) -and $sanIp.Equals($expectedIp)) {
+                    return $true
+                }
+                continue   # an IP target never matches a wildcard
+            }
 
             if ($n.StartsWith('*.')) {
                 $suffix = $n.Substring(1)                 # ".example.com"
