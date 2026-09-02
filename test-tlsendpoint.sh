@@ -500,10 +500,15 @@ run_one() {
     heading "Chain as validated against this host's trust store"
 
     local chain_lines
-    # keep openssl's own indentation, which nests i:/a:/v: under their subject
-    chain_lines=$(awk '/^Certificate chain/ { grab = 1; next }
-                       /-----BEGIN CERTIFICATE-----/ { grab = 0 }
-                       grab { print }' "$out")
+    # keep openssl's own indentation, which nests i:/a:/v: under their subject.
+    # openssl interleaves a PEM block after every depth, so skip those rather
+    # than stopping at the first one, or only the leaf is ever shown. The
+    # chain block ends at the lone "---" separator.
+    chain_lines=$(awk '/^Certificate chain/          { grab = 1; next }
+                       grab && /^---$/               { grab = 0 }
+                       /-----BEGIN CERTIFICATE-----/ { skip = 1 }
+                       /-----END CERTIFICATE-----/   { skip = 0; next }
+                       grab && !skip                 { print }' "$out")
     if [ -n "$chain_lines" ]; then
         printf '%s\n' "$chain_lines" | while IFS= read -r line; do say "$line"; done
     else
