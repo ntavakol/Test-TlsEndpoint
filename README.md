@@ -43,6 +43,9 @@ no intermediate cache and do not fetch via AIA.
 # does the server send its intermediates, or only the leaf?
 .\Test-TlsEndpoint.ps1 mail.example.com 465 -ShowWireChain
 
+# ask one DNS server rather than the system resolver
+.\Test-TlsEndpoint.ps1 www.example.com 443 -DnsServer 8.8.4.4
+
 # connect by IP but validate a named certificate
 .\Test-TlsEndpoint.ps1 -ComputerName 192.0.2.10 -Port 636 -SniName dc01.example.com
 
@@ -82,6 +85,7 @@ Import-Csv .\endpoints.csv |
 | `SniName` | `ComputerName` | SNI value and the name validated against the SAN |
 | `TlsVersion` | `Auto` | `Auto`, `Tls`, `Tls11`, `Tls12`, `Tls13` |
 | `TimeoutMs` | `5000` | Connect and read timeout |
+| `DnsServer` | system resolver | Resolve against this DNS server, and connect to what it answers |
 | `ExpiryWarningDays` | `30` | Threshold for the expiry warning |
 | `ShowWireChain` | off | Use OpenSSL to show what the server actually presents |
 | `SendSyslog` | off | Send an RFC 5424 message with RFC 5425 framing |
@@ -114,6 +118,9 @@ chmod +x test-tlsendpoint.sh
 ```bash
 # full detail of every certificate the server sends
 ./test-tlsendpoint.sh mail.example.com 465 --show-wire-chain
+
+# ask one DNS server rather than the system resolver
+./test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4
 
 # connect by IP but validate a named certificate
 ./test-tlsendpoint.sh 192.0.2.10 636 --sni dc01.example.com
@@ -159,6 +166,7 @@ jq -r 'select(.daysLeft != null and .daysLeft < 30) | .host' report.jsonl
 | `--sni NAME` | `<host>` | SNI value and the name validated against the SAN |
 | `--tls-version VER` | `auto` | `auto`, `1.0`, `1.1`, `1.2`, `1.3` |
 | `--timeout SECONDS` | `5` | Connect and read timeout |
+| `--dns-server ADDR` | system resolver | Resolve against this DNS server, and connect to what it answers |
 | `--expiry-warning-days N` | `30` | Threshold for the expiry warning |
 | `--show-wire-chain` | off | Print every certificate the server sends, in full |
 | `--send-syslog` | off | Send an RFC 5424 message with RFC 5425 framing |
@@ -243,6 +251,16 @@ none of them exist the check is skipped rather than guessed at.
 Address literals skip the lookup. Resolved addresses are reported on success
 and carried on the result, which is also how you catch a stale record or a
 split-horizon zone handing you the wrong host.
+
+**`--dns-server` / `-DnsServer`** asks one named server instead of the system
+resolver, which is how you tell a broken endpoint apart from a resolver that
+disagrees with its neighbours: run the same test against the DHCP-assigned
+server and against a public one, then compare. The connect is then made to the
+address that server returned, because leaving the connect to the system
+resolver would let it quietly overrule the flag. IPv4 is preferred among the
+answers, since a host with no IPv6 route otherwise fails for reasons that have
+nothing to do with the endpoint. The name being validated is still `--sni`,
+which defaults to the host, so certificate matching is unaffected.
 
 **SAN does not match** is the single most common cause of a client connecting,
 completing the TCP handshake, then immediately resetting. If a device is

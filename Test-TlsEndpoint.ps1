@@ -35,6 +35,12 @@
     certificate against. Defaults to ComputerName. Set this when connecting by
     IP to a host that serves a named certificate.
 
+.PARAMETER DnsServer
+    Resolve ComputerName against this DNS server rather than the system
+    resolver. Takes an IP address. The hosts file and the system resolver
+    are bypassed, and the connect is made to the address this server
+    returns, so the whole test reflects that one server's answer.
+
 .PARAMETER TlsVersion
     Protocol to offer. Auto offers everything the platform supports.
 
@@ -114,6 +120,8 @@ param(
 
     [string]$SniName,
 
+    [string]$DnsServer,
+
     [ValidateSet('Auto', 'Tls', 'Tls11', 'Tls12', 'Tls13')]
     [string]$TlsVersion = 'Auto',
 
@@ -157,13 +165,51 @@ begin {
     # will honour them. The async form is used only to bound the wait; the
     # synchronous overload takes no timeout.
     function Resolve-TargetAddress {
-        param([string]$Name, [int]$TimeoutMs)
+        param([string]$Name, [int]$TimeoutMs, [string]$Server)
 
-        $task = [Net.Dns]::GetHostAddressesAsync($Name)
-        if (-not $task.Wait($TimeoutMs)) {
-            throw "timed out after $TimeoutMs ms"
+        if (-not $Server) {
+            $task = [Net.Dns]::GetHostAddressesAsync($Name)
+            if (-not $task.Wait($TimeoutMs)) {
+                throw "timed out after $TimeoutMs ms"
+            }
+            $addresses = @($task.Result | ForEach-Object { $_.IPAddressToString })
         }
-        $addresses = @($task.Result)
+        else {
+            if (-not (Get-Command Resolve-DnsName -ErrorAction SilentlyContinue)) {
+                throw 'asking a named server needs Resolve-DnsName, which is Windows only'
+            }
+            # Resolve-DnsName has no timeout of its own, so it is driven in a
+            # runspace that can be abandoned, keeping -TimeoutMs meaningful
+            # on this path too.
+            $shell    = [PowerShell]::Create()
+            $timedOut = $false
+            try {
+                $null = $shell.AddCommand('Resolve-DnsName').
+                    AddParameter('Name',        $Name).
+                    AddParameter('Server',      $Server).
+                    AddParameter('Type',        'A_AAAA').
+                    AddParameter('DnsOnly',     $true).
+                    AddParameter('NoHostsFile', $true)
+                $async = $shell.BeginInvoke()
+                if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs)) {
+                    # Stop() and Dispose() both block until the query gives up,
+                    # which is the wait -TimeoutMs exists to cut short. Abandon
+                    # the runspace instead; the process reclaims it on exit.
+                    $timedOut = $true
+                    $null = $shell.BeginStop($null, $null)
+                    throw "timed out after $TimeoutMs ms"
+                }
+                $records = $shell.EndInvoke($async)
+                # the fault is on the error stream, where it reads as itself
+                if ($shell.Streams.Error.Count) {
+                    throw $shell.Streams.Error[0].Exception.Message
+                }
+            }
+            finally { if (-not $timedOut) { $shell.Dispose() } }
+            $addresses = @($records | Where-Object { $_.IPAddress } |
+                           ForEach-Object { $_.IPAddress })
+        }
+
         if ($addresses.Count -eq 0) {
             throw 'the resolver returned no addresses'
         }
@@ -260,6 +306,7 @@ process {
         ComputerName    = $ComputerName
         Port            = $Port
         SniName         = $SniName
+        DnsServer       = $DnsServer
         Resolved        = @()
         TcpOpen         = $false
         TlsProtocol     = $null
@@ -286,28 +333,52 @@ process {
     # ------------------------------------------------------------- DNS first
     # A name that does not resolve can never connect, and reporting that as a
     # refused connection sends the reader after a firewall that is not there.
+    if ($DnsServer) {
+        $probe = $null
+        if (-not [Net.IPAddress]::TryParse($DnsServer, [ref]$probe)) {
+            throw "-DnsServer takes an IP address, not '$DnsServer'"
+        }
+    }
+
+    $via       = if ($DnsServer) { " via $DnsServer" } else { '' }
+    $connectTo = $ComputerName
     $ipLiteral = $null
     if (-not [Net.IPAddress]::TryParse($ComputerName, [ref]$ipLiteral)) {
         try {
-            $addresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs
+            $addresses = Resolve-TargetAddress -Name $ComputerName -TimeoutMs $TimeoutMs -Server $DnsServer
         } catch {
             $reason = $_.Exception
             while ($reason.InnerException) { $reason = $reason.InnerException }
-            $result.Error = "DNS resolution failed: '$ComputerName' did not resolve"
-            Write-Line "DNS resolution for '$ComputerName' failed: $($reason.Message)" 'Red'
+            $result.Error = "DNS resolution failed: '$ComputerName' did not resolve$via"
+            Write-Line "DNS resolution for '$ComputerName'$via failed: $($reason.Message)" 'Red'
             Write-Line 'The name did not resolve, so the service was never contacted.' 'Red'
-            Write-Line 'Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone.' 'Yellow'
+            if ($DnsServer) {
+                Write-Line "That is the answer from $DnsServer alone. Another resolver may well differ." 'Yellow'
+            } else {
+                Write-Line 'Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone.' 'Yellow'
+            }
             if ($PassThru) { $result }
             return
         }
-        $result.Resolved = @($addresses | ForEach-Object { $_.IPAddressToString })
-        Write-Line ("Resolved {0} to {1}" -f $ComputerName, ($result.Resolved -join ', '))
+        $result.Resolved = @($addresses)
+        Write-Line ("Resolved {0}{1} to {2}" -f $ComputerName, $via, ($result.Resolved -join ', '))
+
+        # A named server is only really honoured if its answer is the one
+        # connected to. Leaving the connect to the system resolver would let
+        # it quietly overrule the flag. IPv4 is preferred because a host
+        # with no IPv6 route fails confusingly.
+        if ($DnsServer) {
+            $v4 = @($result.Resolved | Where-Object { $_ -notmatch ':' })
+            $connectTo = if ($v4.Count) { $v4[0] } else { $result.Resolved[0] }
+            $target    = "${connectTo}:${Port}"
+            Write-Line ("Connecting to {0}, validating the name '{1}'" -f $connectTo, $SniName)
+        }
     }
 
     # ------------------------------------------------------------ TCP connect
     $tcp = New-Object Net.Sockets.TcpClient
     try {
-        $iar = $tcp.BeginConnect($ComputerName, $Port, $null, $null)
+        $iar = $tcp.BeginConnect($connectTo, $Port, $null, $null)
         if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
             throw "timed out after $TimeoutMs ms"
         }

@@ -44,6 +44,7 @@ JSON=0
 QUIET=0
 USE_COLOR=auto
 TARGETS_FILE=''
+DNS_SERVER=''
 
 WORKDIR=''
 WORST_EXIT=0
@@ -98,6 +99,10 @@ CONNECTION
                           Defaults to <host>. Set when connecting by IP.
   --tls-version VER       auto (default), 1.0, 1.1, 1.2, 1.3
   --timeout SECONDS       Connect and read timeout. Default 5.
+  --dns-server ADDR       Resolve the name against this DNS server rather
+                          than the system resolver. Takes an IP address.
+                          Bypasses the hosts file: this asks what that
+                          server says, which is the point of asking it.
   --expiry-warning-days N Warn when the leaf expires within N days. Default 30.
   --show-wire-chain       Print full detail of every certificate the server
                           sends, not just the summary count.
@@ -131,6 +136,7 @@ EXAMPLES
   test-tlsendpoint.sh mail.example.com 465 --show-wire-chain
   test-tlsendpoint.sh 192.0.2.10 636 --sni dc01.example.com
   test-tlsendpoint.sh www.example.com 443 --tls-version 1.2
+  test-tlsendpoint.sh www.example.com 443 --dns-server 8.8.4.4
   test-tlsendpoint.sh syslog.example.com 6514 --send-syslog --count 3
   test-tlsendpoint.sh www.example.com 443 --read-response \
       --send-raw 'GET / HTTP/1.1\r\nHost: www.example.com\r\nConnection: close\r\n\r\n'
@@ -203,12 +209,58 @@ hosts_file_lookup() {
     done
 }
 
+# addresses out of an nslookup answer, skipping the resolver's own address,
+# which precedes the first Name: line
+nslookup_addresses() {
+    awk '
+        /^Name:/ { seen = 1; cont = 0; next }
+        seen && /^Address(es)?:/ {
+            sub(/^Address(es)?:[[:space:]]*/, ""); cont = 1
+            if ($0 != "") print
+            next
+        }
+        seen && cont && /^[[:space:]]+[0-9a-fA-F.:]+[[:space:]]*$/ {
+            gsub(/[[:space:]]/, ""); print; next
+        }
+        { cont = 0 }
+    ' | sort -u
+}
+
+# Ask one named server directly. Returns 3 when nothing on PATH can do that,
+# which is a configuration error rather than a lookup failure: quietly falling
+# back to the system resolver would answer a different question than the one
+# asked.
+resolve_via_server() {
+    local name=$1 server=$2 out
+    if command -v dig >/dev/null 2>&1; then
+        out=$( { with_timeout "$TIMEOUT" dig +short "@$server" -t A    "$name" 2>/dev/null
+                 with_timeout "$TIMEOUT" dig +short "@$server" -t AAAA "$name" 2>/dev/null
+               } | grep -E '^[0-9a-fA-F.:]+$' | sort -u)
+    elif command -v host >/dev/null 2>&1; then
+        out=$(with_timeout "$TIMEOUT" host "$name" "$server" 2>/dev/null |
+              sed -n 's/.* has \(IPv6 \)*address //p' | sort -u)
+    elif command -v nslookup >/dev/null 2>&1; then
+        out=$(with_timeout "$TIMEOUT" nslookup "$name" "$server" 2>/dev/null | nslookup_addresses)
+    else
+        return 3
+    fi
+    [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
+    return 1
+}
+
 # Addresses for a name, one per line, empty output if it does not resolve.
 # getent goes through getaddrinfo, exactly like the connect that follows, so
 # it is trusted outright; the rest are fallbacks for systems without it.
 # Returns 2, distinct from a lookup failure, when no resolver tool exists.
 resolve_host() {
     local name=$1 out
+
+    # A named server is a question about that server, so the hosts file and
+    # the system resolver are deliberately bypassed.
+    if [ -n "$DNS_SERVER" ]; then
+        resolve_via_server "$name" "$DNS_SERVER"
+        return $?
+    fi
 
     out=$(hosts_file_lookup "$name")
     [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
@@ -245,19 +297,7 @@ resolve_host() {
     fi
 
     if command -v nslookup >/dev/null 2>&1; then
-        # skip the resolver's own address, which precedes the first Name: line
-        out=$(with_timeout "$TIMEOUT" nslookup "$name" 2>/dev/null | awk '
-            /^Name:/ { seen = 1; cont = 0; next }
-            seen && /^Address(es)?:/ {
-                sub(/^Address(es)?:[[:space:]]*/, ""); cont = 1
-                if ($0 != "") print
-                next
-            }
-            seen && cont && /^[[:space:]]+[0-9a-fA-F.:]+[[:space:]]*$/ {
-                gsub(/[[:space:]]/, ""); print; next
-            }
-            { cont = 0 }
-        ' | sort -u)
+        out=$(with_timeout "$TIMEOUT" nslookup "$name" 2>/dev/null | nslookup_addresses)
         [ -n "$out" ] && { printf '%s\n' "$out"; return 0; }
         return 1
     fi
@@ -338,6 +378,7 @@ parse_args() {
         case $1 in
             --sni)                 need_value "$1" $(($# - 1)); SNI=$2; shift 2 ;;
             --tls-version|--tls)   need_value "$1" $(($# - 1)); TLS_VERSION=$(lower "$2"); shift 2 ;;
+            --dns-server)          need_value "$1" $(($# - 1)); DNS_SERVER=$2; shift 2 ;;
             --timeout)             need_value "$1" $(($# - 1)); TIMEOUT=$2; shift 2 ;;
             --expiry-warning-days) need_value "$1" $(($# - 1)); EXPIRY_WARNING_DAYS=$2; shift 2 ;;
             --show-wire-chain)     SHOW_WIRE_CHAIN=1; shift ;;
@@ -432,6 +473,7 @@ issuer_of()  { openssl x509 -noout -issuer  -nameopt RFC2253 -in "$1" 2>/dev/nul
 run_one() {
     local host=$1 port=$2
     local sni=${SNI:-$host}
+    local connect=$host
     local target; target=$(hostport "$host" "$port")
     local dir="$WORKDIR/target-$$-$RANDOM"
     mkdir -p "$dir" || die "cannot create work directory"
@@ -455,25 +497,44 @@ run_one() {
     if ! is_ip_literal "$host"; then
         local addrs rrc
         addrs=$(resolve_host "$host"); rrc=$?
+        local via=''
+        [ -n "$DNS_SERVER" ] && via=" via $DNS_SERVER"
+        if [ $rrc -eq 3 ]; then
+            die "--dns-server needs dig, host or nslookup on PATH"
+        fi
         if [ $rrc -eq 1 ]; then
-            r_error="DNS resolution failed: '$host' did not resolve"
-            bad "DNS resolution for '$host' failed. The name did not resolve, so the service was never contacted."
-            warn "Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone."
+            r_error="DNS resolution failed: '$host' did not resolve${via}"
+            bad "DNS resolution for '$host'$via failed. The name did not resolve, so the service was never contacted."
+            if [ -n "$DNS_SERVER" ]; then
+                warn "That is the answer from $DNS_SERVER alone. Another resolver may well differ."
+            else
+                warn "Check the resolver rather than the endpoint: the host, the search domain, or a split-horizon zone."
+            fi
             emit_result; note_exit $EX_DNS; return $EX_DNS
         fi
         if [ $rrc -eq 0 ]; then
             printf '%s\n' "$addrs" > "$addrfile"
-            say "Resolved $host to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+            say "Resolved $host$via to $(printf '%s' "$addrs" | tr '\n' ' ' | sed 's/ $//; s/ /, /g')"
+            # A named server is only really honoured if its answer is the
+            # one connected to. Leaving the connect to the system resolver
+            # would let it quietly overrule the flag. IPv4 is preferred
+            # because a host with no IPv6 route fails confusingly.
+            if [ -n "$DNS_SERVER" ]; then
+                connect=$(printf '%s\n' "$addrs" | grep -v ':' | head -1)
+                [ -z "$connect" ] && connect=$(printf '%s\n' "$addrs" | head -1)
+                target=$(hostport "$connect" "$port")
+                say "Connecting to $connect, validating the name '$sni'"
+            fi
         fi
         # rrc 2 means no resolver tool was found; say nothing and let the
         # connect below speak for itself
     fi
 
     # -------------------------------------------------------- TCP reachable
-    if with_timeout "$TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$host" "$port" >/dev/null 2>&1; then
+    if with_timeout "$TIMEOUT" bash -c 'exec 3<>/dev/tcp/"$1"/"$2"' _ "$connect" "$port" >/dev/null 2>&1; then
         r_tcp=1
     elif command -v nc >/dev/null 2>&1 &&
-         with_timeout "$TIMEOUT" nc -z "$host" "$port" >/dev/null 2>&1; then
+         with_timeout "$TIMEOUT" nc -z "$connect" "$port" >/dev/null 2>&1; then
         r_tcp=1
     fi
 
@@ -815,6 +876,7 @@ emit_result() {
     printf '"host":%s,'              "$(json_str "$host")"
     printf '"port":%s,'              "$(json_num "$port")"
     printf '"sni":%s,'               "$(json_str "$sni")"
+    printf '"dnsServer":%s,'         "$(json_str "$DNS_SERVER")"
     printf '"resolved":%s,'          "$(json_array < "$addrfile")"
     printf '"tcpOpen":%s,'           "$(json_bool "$r_tcp")"
     printf '"tlsProtocol":%s,'       "$(json_str "$r_proto")"
@@ -872,6 +934,9 @@ main() {
     parse_args "$@"
     setup_color
     tls_flag >/dev/null    # validate --tls-version before doing any work
+    if [ -n "$DNS_SERVER" ] && ! is_ip_literal "$DNS_SERVER"; then
+        die "--dns-server takes an IP address, not '$DNS_SERVER'"
+    fi
 
     command -v openssl >/dev/null 2>&1 ||
         die "openssl not found on PATH. Install it, or use Test-TlsEndpoint.ps1, which needs no openssl."
