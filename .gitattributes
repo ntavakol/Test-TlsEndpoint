@@ -1,0 +1,8 @@
+# Shell scripts must keep LF endings or they will not run on Linux or macOS.
+*.sh text eol=lf
+
+# PowerShell is happy either way; CRLF keeps Windows editors predictable.
+*.ps1 text eol=crlf
+
+*.md  text
+LICENSE text
